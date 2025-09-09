@@ -9,9 +9,45 @@ static const bool DEBUG_LOG_RXTX = false; // NOTE: Will probably trigger WDT
 using namespace esphome;
 using namespace dali;
 
+void DaliInterrupt::gpio_intr(DaliInterrupt *queue) {
+    // Ignore if not initialized
+    if (!queue->init) return;
+
+    // Ignore if queue is full
+    if (queue->received_queue_pos >= NUM_ENTRIES) return;
+
+    // Read pin state and timestamp
+    uint32_t ts = micros();
+    bool level = queue->rx_pin->digital_read();
+
+    // Add to queue
+    queue->received_queue[queue->received_queue_pos] = { ts, level };
+
+    // Advance position until end is reached, do not reset
+    if (queue->received_queue_pos < NUM_ENTRIES) {
+        queue->received_queue_pos++;
+    }
+}
+
+void DaliInterrupt::reset()
+{
+    // cheap way to disable interrupts while resetting
+    this->init = false;
+
+    std::memset(this->received_queue, 0, sizeof(this->received_queue));
+    this->received_queue_pos = 0;
+
+    this->init = true;
+}
+
 void DaliBusComponent::setup() {
     m_txPin->pin_mode(gpio::Flags::FLAG_OUTPUT);
     m_rxPin->pin_mode(gpio::Flags::FLAG_INPUT);
+
+    this->m_interrupt_queue.rx_pin = m_rxPin;
+    this->m_interrupt_queue.reset();
+    this->armInterrupt();
+
     DALI_LOGI("DALI bus ready");
 
     if (m_discovery) {
@@ -132,6 +168,11 @@ void DaliBusComponent::setup() {
                     is_discovered[short_addr] = true;
                 }
 
+                {
+                    uint8_t status = dali.port.sendQueryCommand(short_addr, DaliCommand::QUERY_STATUS);
+                    DALI_LOGI("    Status: 0x%02x", status);
+                }
+
                 // Dynamic component creation (if not defined in YAML)
                 if (m_addresses[short_addr]) {
                     DALI_LOGD("  Ignoring, already defined");
@@ -151,6 +192,9 @@ void DaliBusComponent::setup() {
                 }
                 else {
                     short_addr = 1;
+                    while (m_addresses[short_addr] != 0) {
+                        short_addr++;
+                    }
                     DALI_LOGI("  Assigning short address: %.2x", short_addr);
 
                     if (!dali.bus_manager.programShortAddress(short_addr)) {
@@ -160,6 +204,20 @@ void DaliBusComponent::setup() {
                     }
 
                     DALI_LOGI("  Device %.6x @ %.2x", long_addr, short_addr);
+
+                    {
+                        uint8_t status = dali.port.sendQueryCommand(short_addr, DaliCommand::QUERY_STATUS);
+                        DALI_LOGI("    Status: 0x%02x", status);
+                    }
+
+                    // Dynamic component creation (if not defined in YAML)
+                    if (m_addresses[short_addr]) {
+                        DALI_LOGD("  Ignoring, already defined");
+                    }
+                    else {
+                        m_addresses[short_addr] = long_addr;
+                        create_light_component(short_addr, long_addr);
+                    }
                 }
             }
         }
@@ -209,7 +267,26 @@ void DaliBusComponent::loop() {
 }
 
 void DaliBusComponent::dump_config() {
+    static const char *const TAG = "dali";
 
+    ESP_LOGCONFIG(TAG, "DALI Bus:");
+    LOG_PIN("  TX Pin: ", m_txPin);
+    LOG_PIN("  RX Pin: ", m_rxPin);
+    ESP_LOGCONFIG(TAG, "  assigned short addresses:");
+    for (int i = 0; i < ADDR_SHORT_MAX; i++) {
+        if (m_addresses[i] > 0) {
+            ESP_LOGCONFIG(TAG, "   - %.2u = %.6x\n", i, m_addresses[i]);
+        }
+    }
+}
+
+
+void inline DaliBusComponent::armInterrupt() {
+    this->m_rxPin->attach_interrupt(DaliInterrupt::gpio_intr, &this->m_interrupt_queue, gpio::INTERRUPT_ANY_EDGE);
+}
+
+void inline DaliBusComponent::disarmInterrupt() {
+    this->m_rxPin->detach_interrupt();
 }
 
 #define QUARTER_BIT_PERIOD 208
@@ -256,6 +333,8 @@ void DaliBusComponent::sendForwardFrame(uint8_t address, uint8_t data) {
         //Serial.print("TX: "); Serial.print(address, HEX); Serial.print(" "); Serial.println(data, HEX);
     }
 
+    this->disarmInterrupt();
+    this->m_interrupt_queue.reset();
     {
         // This is timing critical
         InterruptLock lock;
@@ -268,43 +347,226 @@ void DaliBusComponent::sendForwardFrame(uint8_t address, uint8_t data) {
 
     // Non critical delay
     delayMicroseconds(HALF_BIT_PERIOD*2);
+    this->armInterrupt();
     delayMicroseconds(BIT_PERIOD*4); // Optional, for clarity in scope trace
 }
 
+
+const uint32_t DELTA = 41; // 10% us tolerance
+/// @brief Check if the time difference is a valid short or long period.
+/// @param diff Time difference in microseconds.
+/// @param long Set to true if the period is a long period, false if short period.
+/// @return true if the period is valid, false otherwise.
+bool valid_diff_period (uint32_t diff, bool &is_long) {
+    if (diff >= HALF_BIT_PERIOD - DELTA && diff <= HALF_BIT_PERIOD + DELTA) {
+        // valid short level change (same symbol / entry transition)
+        is_long = false;
+        return true;
+    } else if (diff >= BIT_PERIOD - DELTA && diff <= BIT_PERIOD + DELTA) {
+        // valid long level change (different symbol / no entry transition)
+        is_long = true;
+        return true;
+    }
+    return false; // timing weird
+};
+
 uint8_t DaliBusComponent::receiveBackwardFrame(unsigned long timeout_ms) {
-    uint8_t data;
+    // uint8_t data;
 
-    unsigned long startTime = millis();
-    uint32_t startMicros = micros();
+    // unsigned long startTime = millis();
+    // uint32_t startMicros = micros();
 
-    // Wait for START bit (timing critical)
-    // TODO: Need a better way to wait for this that doens't block the CPU
-    while (m_rxPin->digital_read() == LOW) {
-        if (millis() - startTime >= timeout_ms) {
+    // // Wait for START bit (timing critical)
+    // // TODO: Need a better way to wait for this that doens't block the CPU
+    // while (m_rxPin->digital_read() == LOW) {
+    //     if (millis() - startTime >= timeout_ms) {
+    //         //Serial.println("No reply");
+    //         if (DEBUG_LOG_RXTX) {
+    //             DALI_LOGD("RX: 00 (NACK)");
+    //         }
+    //         return 0;
+    //     }
+    // }
+
+    // {
+    //     // This is timing critical
+    //     InterruptLock lock;
+
+    //     delayMicroseconds(BIT_PERIOD); // Wait for first data bit
+    //     delayMicroseconds(QUARTER_BIT_PERIOD); // Wait a quater bit period to sample middle of first half bit
+    //     data = readByte();
+    //     delayMicroseconds(BIT_PERIOD*2); // Wait for STOP bits
+    // }
+
+    // //Serial.print("RX: "); Serial.println(data, HEX);
+    // if (DEBUG_LOG_RXTX) {
+    //     DALI_LOGD("RX: %02x", data);
+    // }
+
+    // // Minimum time before we can send another forward frame
+    // delayMicroseconds(BIT_PERIOD*8);
+    // return data;
+
+
+
+    /*
+    SIGNAL CHARACTERISTICS
+    High Level: 9.5 to 22.5 V (Typical 16 V)
+    Low Level: -6.5 to + 6.5 V (Typical 0 V)
+    Te = half cycle = 416.67 us +/- 10 %
+    10 us <= tfall <= 100 us
+    10 us <= trise <= 100 us
+
+    BIT TIMING
+    msb send first
+    logical 1 = 1Te Low 1Te High
+    logical 0 = 1Te High 1Te Low
+    Start bit = logical 1
+    Stop bit = 2Te High
+
+    FRAME TIMING
+    FF: TX Forward Frame 2 bytes (38Te) = 2*(1start+16bits+2stop)
+    BF: RX Backward Frame 1 byte (22Te) = 2*(1start+8bits+2stop)
+    no reply: FF >22Te pause FF
+    with reply: FF >7Te <22Te pause BF >22Te pause FF
+    */
+
+    // Using interrupt-driven reception instead of timing-critical polling
+    DaliInterrupt &queue = this->m_interrupt_queue;
+    uint8_t bits_received = 0; // number of bits received so far, max 8
+    bool last_level = false;   // used for sanity checks
+    bool long_out = false;     // if the symbol ends with a long period
+    bool long_in = false;      // if the symbol starts with a long period
+    uint32_t diff_out = 0;
+    uint32_t diff_in = 0;
+    uint8_t data = 0;
+
+    // pos should always point to the middle of the symbol which always exists (due to Manchester encoding)
+    // The start bit starts with a high to low transition since the bus idle state is high.
+    // Therefore the position 0 is the begin of the start bit and position 1 is the middle of the start symbol.
+    size_t pos = 1;
+
+    // wait for enough data or timeout
+    uint32_t startTime = millis();
+    uint32_t last_received_us = queue.received_queue[queue.received_queue_pos-1].ts;
+    // 10 is the minumum number of transitions possible
+    // FIXME: right now the code does not handle waiting periods good enough, therefore check if we are receiving data right now
+    while (queue.received_queue_pos < 10 || micros() - last_received_us < BIT_PERIOD) {
+        // don't exit if we are still receiving data
+        if (millis() - startTime >= timeout_ms && micros() - last_received_us >= BIT_PERIOD * 2) {
             //Serial.println("No reply");
             if (DEBUG_LOG_RXTX) {
-                DALI_LOGD("RX: 00 (NACK)");
+                DALI_LOGD("RX: 00 (NACK, timeout) queue len = %u, %u us", queue.received_queue_pos, (micros() - queue.received_queue[queue.received_queue_pos-1].ts));
             }
+            return 0;
+        }
+        delay(1);
+        last_received_us = queue.received_queue[queue.received_queue_pos-1].ts;
+    }
+
+    if (DEBUG_LOG_RXTX) {
+        DALI_LOGD("  RX[%02d]: %10u %5s", 0, queue.received_queue[0].ts, queue.received_queue[0].level ? "HIGH" : "LOW");
+        for (size_t i = 1; i < queue.received_queue_pos; i++) {
+            uint32_t diff = queue.received_queue[i].ts - queue.received_queue[i-1].ts;
+            bool lng = false;
+            DALI_LOGD("  RX[%02d]: %10u %5s %7u %6s", i, queue.received_queue[i].ts, queue.received_queue[i].level ? "HIGH" : "LOW", diff, (valid_diff_period(diff, lng) ? (lng ? "LONG" : "SHORT") : "INVAL") );
+        }
+    }
+
+    // find start bit, first to be low level
+    // TODO: is this still needed? Haven't seen this being hit in a while
+    while (queue.received_queue[pos-1].level != LOW) {
+        DALI_LOGD("RX: searching start bit, skipped one");
+        pos++;
+    }
+
+    // expect start bit = logical 1
+    diff_in = queue.received_queue[pos].ts - queue.received_queue[pos-1].ts;
+    diff_out = queue.received_queue[pos+1].ts - queue.received_queue[pos].ts;
+    if (!valid_diff_period(diff_in, long_in) || !valid_diff_period(diff_out, long_out)) {
+        // timing weird (period does not match)
+        DALI_LOGW("RX: 00 (NACK, no start bit, timing) pos = %u", pos);
+        return 0; // no start bit
+    }
+    if (long_in) {
+        // timing weird (this transition is supposed to be short = HALF_BIT_PERIOD)
+        DALI_LOGW("RX: 00 (NACK, no start bit, timing long_in) pos = %u", pos);
+        return 0; // no start bit
+    }
+    if (queue.received_queue[pos-1].level == HIGH || queue.received_queue[pos].level == LOW) {
+        // gpio level weird
+        DALI_LOGW("RX: 00 (NACK, no start bit, level) pos = %u", pos);
+        return 0; // no start bit
+    }
+
+    pos += long_out ? 1 : 2; // move pos to the middle of the next symbol
+    last_level = HIGH; // end of start bit
+
+    // expect data bits
+    for (;bits_received < 8;) {
+        // diff to previous entry
+        diff_in = queue.received_queue[pos].ts - queue.received_queue[pos-1].ts;
+        if (valid_diff_period(diff_in, long_in)) {
+            // timings are valid
+
+            // sanity checks:
+            // depending on the previous symbol, there night be a level change at the start of the current symbol or not
+            if (long_in == false) {
+                // short period, therefore level change at the beginning of the current symbol
+                // -> should be the same symbol than before
+                if (queue.received_queue[pos-1].level == last_level
+                    || queue.received_queue[pos].level != last_level) {
+                    // level did not change, but should have
+                    DALI_LOGW("RX: 00 (NACK, level did not change) pos = %u", pos);
+                    return 0;
+                }
+            } else {
+                // long period, therefore no level change at the beginning of the current symbol
+                // -> should be a different symbol than before
+                if (queue.received_queue[pos-1].level != last_level
+                    || queue.received_queue[pos].level == last_level) {
+                    // level did change, but should not have
+                    DALI_LOGW("RX: 00 (NACK, level changed) pos = %u", pos);
+                    return 0;
+                }
+            }
+
+            data = (data << 1) | (queue.received_queue[pos-1].level == LOW ? 1 : 0);
+            bits_received++;
+
+            if (queue.received_queue[pos+1].ts != 0) {
+                diff_out = queue.received_queue[pos+1].ts - queue.received_queue[pos].ts;
+                valid_diff_period(diff_out, long_out);
+            } else {
+                // edge case, end of byte
+                // the stop bit is a long level high, therefore the usual timings don't fit
+                // only hit when the current symbol ends with a high level
+                if (bits_received != 8) {
+                    DALI_LOGW("RX: 00 (NACK, byte incomplete) pos = %u", pos);
+                    return 0; // byte incomplete
+                }
+                break;
+            }
+
+            last_level = queue.received_queue[pos].level;
+            pos += long_out ? 1 : 2; // move pos to the middle of the next symbol
+        } else {
+            // timing weird
+            DALI_LOGW("RX: 00 (NACK, timing weird) pos = %u", pos);
             return 0;
         }
     }
 
-    {
-        // This is timing critical
-        InterruptLock lock;
+    // expect stop bits
+    // we have no entries for this
 
-        delayMicroseconds(BIT_PERIOD); // Wait for first data bit
-        delayMicroseconds(QUARTER_BIT_PERIOD); // Wait a quater bit period to sample middle of first half bit
-        data = readByte();
-        delayMicroseconds(BIT_PERIOD*2); // Wait for STOP bits
-    }
+    // cleanup and prepare for next reception
+    this->m_interrupt_queue.reset();
 
-    //Serial.print("RX: "); Serial.println(data, HEX);
     if (DEBUG_LOG_RXTX) {
         DALI_LOGD("RX: %02x", data);
     }
 
-    // Minimum time before we can send another forward frame
-    delayMicroseconds(BIT_PERIOD*8); 
+    delayMicroseconds(BIT_PERIOD*7); // Minimum time before we can send another forward frame
     return data;
 }

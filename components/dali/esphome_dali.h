@@ -12,6 +12,24 @@ enum class DaliInitMode {
     InitializeAll
 };
 
+struct DaliInterrupt {
+    struct interrupt_entry {
+        uint32_t ts;
+        bool level;
+    };
+
+    #define NUM_ENTRIES 25 // (1 (start bit) + 8 (data bits) + 2 (stop bits)) * 2 + buffer (is this usefull at all?)
+    /* volatile */ interrupt_entry received_queue[NUM_ENTRIES]{0};
+    size_t received_queue_pos{0};
+
+    InternalGPIOPin* rx_pin{nullptr};
+    bool init{false};
+
+    static void gpio_intr(DaliInterrupt *queue);
+    void reset();
+};
+
+
 class DaliBusComponent : public Component, public DaliPort {
 public:
     DaliBusComponent()
@@ -24,14 +42,14 @@ public:
     void dump_config() override;
 
     void set_tx_pin(GPIOPin* tx_pin) { m_txPin = tx_pin; }
-    void set_rx_pin(GPIOPin* rx_pin) { m_rxPin = rx_pin; }
+    void set_rx_pin(InternalGPIOPin* rx_pin) { m_rxPin = rx_pin; }
 
     /// @brief Perform automatic device discovery on setup.
     /// Light components will automatically be created and appear in HomeAssistant
     void do_device_discovery() { m_discovery = true; }
 
     /// @brief Initialize long and short addresses for devices on the bus.
-    /// @param mode 
+    /// @param mode
     //          InitializeUnassigned - only devices that do not yet have an assigned short address
     ///         InitializeAll - all devices on the bus
     /// @note
@@ -59,14 +77,19 @@ private:
     void writeByte(uint8_t b);
     uint8_t readByte();
 
+    void inline armInterrupt();
+    void inline disarmInterrupt();
+
     void create_light_component(short_addr_t short_addr, uint32_t long_addr);
 
-    GPIOPin* m_rxPin;
+    InternalGPIOPin* m_rxPin;
     GPIOPin* m_txPin;
 
     bool m_discovery = false;
     DaliInitMode m_initialize_addresses = DaliInitMode::DiscoverOnly;
     uint32_t m_addresses[ADDR_SHORT_MAX+1] = {0};
+
+    DaliInterrupt m_interrupt_queue;
 };
 
 }  // namespace dali
