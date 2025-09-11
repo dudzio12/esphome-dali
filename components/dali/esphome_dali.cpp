@@ -4,7 +4,8 @@
 #include "esphome_dali_light.h"
 
 //static const char *const TAG = "dali";
-static const bool DEBUG_LOG_RXTX = false; // NOTE: Will probably trigger WDT
+static const bool DEBUG_LOG_RXTX = false;
+static const bool DEBUG_LOG_RXTX_FULL = false;
 
 using namespace esphome;
 using namespace dali;
@@ -40,6 +41,22 @@ void DaliInterrupt::reset()
     this->init = true;
 }
 
+// Prints the DALI QUERY_STATUS (0x90) response in a human-readable format
+void print_dali_status(uint8_t status, uint8_t address) {
+  char buffer[128];
+  snprintf(buffer, sizeof(buffer), "DALI[%.2d] Status: %s | %s | %s | %s | %s | %s | %s | %s",
+           address,
+           (status & 0x01) ? "Gear Failed" : "Gear OK",
+           (status & 0x02) ? "Lamp Failed" : "Lamp OK",
+           (status & 0x04) ? "Lamp On" : "Lamp Off",
+           (status & 0x08) ? "Limit Error" : "Level OK",
+           (status & 0x10) ? "Fading" : "Not Fading",
+           (status & 0x20) ? "Reset State" : "Not Reset",
+           (status & 0x40) ? "No Address" : "Address OK",
+           (status & 0x80) ? "Power Failure" : "Power OK");
+  DALI_LOGI("%s", buffer);
+}
+
 void DaliBusComponent::setup() {
     m_txPin->pin_mode(gpio::Flags::FLAG_OUTPUT);
     m_rxPin->pin_mode(gpio::Flags::FLAG_INPUT);
@@ -56,6 +73,11 @@ void DaliBusComponent::setup() {
         if (false) {
             this->resetBus();
             esp_task_wdt_reset();
+            // {
+            //     // reset everything and initialize all devices
+            //     this->dali.reset(ADDR_BROADCAST);
+            //     this->m_initialize_addresses = DaliInitMode::InitializeAll
+            // }
         }
 
         if (dali.bus_manager.isControlGearPresent()) {
@@ -73,12 +95,12 @@ void DaliBusComponent::setup() {
         if (this->m_initialize_addresses != DaliInitMode::DiscoverOnly) {
             if (this->m_initialize_addresses == DaliInitMode::InitializeAll) {
                 DALI_LOGI("Randomizing addresses for *all* DALI devices");
-                dali.bus_manager.initialize(ASSIGN_ALL); 
-            } 
+                dali.bus_manager.initialize(ASSIGN_ALL);
+            }
             else if (this->m_initialize_addresses == DaliInitMode::InitializeUnassigned) {
                 // Only randomize devices without an assigned short address
                 DALI_LOGI("Randomizing addresses for unassigned DALI devices");
-                dali.bus_manager.initialize(ASSIGN_UNINITIALIZED); 
+                dali.bus_manager.initialize(ASSIGN_UNINITIALIZED);
             }
 
             dali.bus_manager.randomize();
@@ -108,14 +130,14 @@ void DaliBusComponent::setup() {
 
             // if (short_addr == 0xFF) {
             //     if (this->m_initialize_addresses) {
-                    
+
             //         //dali.bus_manager.programShortAddress(count);
             //         // short_addr_t new_addr = 1;
             //         // programShortAddress(new_addr);
-            
+
             //         // port.sendSpecialCommand(DaliSpecialCommand::QUERY_SHORT_ADDRESS, 0);
             //         // out_short_addr = port.receiveBackwardFrame();
-            
+
             //         // if (out_short_addr != new_addr) {
             //         //     DALI_LOGE("Could not program short address");
             //         //     out_short_addr = 0xFF;
@@ -127,7 +149,7 @@ void DaliBusComponent::setup() {
 
             //         dali.port.sendSpecialCommand(DaliSpecialCommand::QUERY_SHORT_ADDRESS, 0);
             //         short_addr = dali.port.receiveBackwardFrame();
-            
+
             //         if (short_addr != new_addr) {
             //             DALI_LOGE("  Could not program short address");
             //             continue;
@@ -168,10 +190,8 @@ void DaliBusComponent::setup() {
                     is_discovered[short_addr] = true;
                 }
 
-                {
-                    uint8_t status = dali.port.sendQueryCommand(short_addr, DaliCommand::QUERY_STATUS);
-                    DALI_LOGI("    Status: 0x%02x", status);
-                }
+                uint8_t status = dali.port.sendQueryCommand(short_addr, DaliCommand::QUERY_STATUS);
+                print_dali_status(status, short_addr);
 
                 // Dynamic component creation (if not defined in YAML)
                 if (m_addresses[short_addr]) {
@@ -191,10 +211,7 @@ void DaliBusComponent::setup() {
                     continue;
                 }
                 else {
-                    short_addr = 1;
-                    while (m_addresses[short_addr] != 0) {
-                        short_addr++;
-                    }
+                    short_addr = count;
                     DALI_LOGI("  Assigning short address: %.2x", short_addr);
 
                     if (!dali.bus_manager.programShortAddress(short_addr)) {
@@ -204,11 +221,8 @@ void DaliBusComponent::setup() {
                     }
 
                     DALI_LOGI("  Device %.6x @ %.2x", long_addr, short_addr);
-
-                    {
-                        uint8_t status = dali.port.sendQueryCommand(short_addr, DaliCommand::QUERY_STATUS);
-                        DALI_LOGI("    Status: 0x%02x", status);
-                    }
+                    uint8_t status = dali.port.sendQueryCommand(short_addr, DaliCommand::QUERY_STATUS);
+                    print_dali_status(status, short_addr);
 
                     // Dynamic component creation (if not defined in YAML)
                     if (m_addresses[short_addr]) {
@@ -237,6 +251,8 @@ void DaliBusComponent::create_light_component(short_addr_t short_addr, uint32_t 
 #ifdef USE_LIGHT
     DaliLight* dali_light = new DaliLight { this };
     dali_light->set_address(short_addr);
+    // the previous call overrides the long address with `0xffff`, set it again, since we know it here
+    m_addresses[short_addr] = long_addr;
 
     const int MAX_STR_LEN = 20;
     char* name = new char[MAX_STR_LEN];
@@ -464,7 +480,7 @@ uint8_t DaliBusComponent::receiveBackwardFrame(unsigned long timeout_ms) {
         last_received_us = queue.received_queue[queue.received_queue_pos-1].ts;
     }
 
-    if (DEBUG_LOG_RXTX) {
+    if (DEBUG_LOG_RXTX_FULL) {
         DALI_LOGD("  RX[%02d]: %10u %5s", 0, queue.received_queue[0].ts, queue.received_queue[0].level ? "HIGH" : "LOW");
         for (size_t i = 1; i < queue.received_queue_pos; i++) {
             uint32_t diff = queue.received_queue[i].ts - queue.received_queue[i-1].ts;
@@ -533,6 +549,9 @@ uint8_t DaliBusComponent::receiveBackwardFrame(unsigned long timeout_ms) {
 
             data = (data << 1) | (queue.received_queue[pos-1].level == LOW ? 1 : 0);
             bits_received++;
+            if (DEBUG_LOG_RXTX_FULL) {
+                DALI_LOGD("  RX: bit %d = %d", bits_received, data & 0x1);
+            }
 
             if (queue.received_queue[pos+1].ts != 0) {
                 diff_out = queue.received_queue[pos+1].ts - queue.received_queue[pos].ts;
