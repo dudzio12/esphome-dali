@@ -84,6 +84,7 @@ private:
 
     InternalGPIOPin* m_rxPin;
     GPIOPin* m_txPin;
+    uint32_t m_last_rx_ts = 0;
 
     bool m_discovery = false;
     DaliInitMode m_initialize_addresses = DaliInitMode::DiscoverOnly;

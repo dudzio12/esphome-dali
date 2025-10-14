@@ -128,41 +128,6 @@ void DaliBusComponent::setup() {
             delay(1); // yield to ESP stack
             esp_task_wdt_reset();
 
-            // if (short_addr == 0xFF) {
-            //     if (this->m_initialize_addresses) {
-
-            //         //dali.bus_manager.programShortAddress(count);
-            //         // short_addr_t new_addr = 1;
-            //         // programShortAddress(new_addr);
-
-            //         // port.sendSpecialCommand(DaliSpecialCommand::QUERY_SHORT_ADDRESS, 0);
-            //         // out_short_addr = port.receiveBackwardFrame();
-
-            //         // if (out_short_addr != new_addr) {
-            //         //     DALI_LOGE("Could not program short address");
-            //         //     out_short_addr = 0xFF;
-            //         // }
-
-            //         short_addr_t new_addr = count;
-
-            //         dali.bus_manager.programShortAddress(new_addr);
-
-            //         dali.port.sendSpecialCommand(DaliSpecialCommand::QUERY_SHORT_ADDRESS, 0);
-            //         short_addr = dali.port.receiveBackwardFrame();
-
-            //         if (short_addr != new_addr) {
-            //             DALI_LOGE("  Could not program short address");
-            //             continue;
-            //         }
-            //     }
-            //     else {
-            //         // You'll need to assign a short address before the device will respond to commands.
-            //         // However it will still respond to BROADCAST brightness updates...
-            //         DALI_LOGW("  No short address assigned!");
-            //         continue;
-            //     }
-            // }
-
             if (short_addr <= ADDR_SHORT_MAX) {
                 DALI_LOGI("  Device %.6x @ %.2x", long_addr, short_addr);
 
@@ -196,6 +161,9 @@ void DaliBusComponent::setup() {
                 // Dynamic component creation (if not defined in YAML)
                 if (m_addresses[short_addr]) {
                     DALI_LOGD("  Ignoring, already defined");
+                    if (m_addresses[short_addr] == 0xffffff) {
+                        m_addresses[short_addr] = long_addr;
+                    }
                 }
                 else {
                     m_addresses[short_addr] = long_addr;
@@ -227,6 +195,9 @@ void DaliBusComponent::setup() {
                     // Dynamic component creation (if not defined in YAML)
                     if (m_addresses[short_addr]) {
                         DALI_LOGD("  Ignoring, already defined");
+                        if (m_addresses[short_addr] == 0xffffff) {
+                            m_addresses[short_addr] = long_addr;
+                        }
                     }
                     else {
                         m_addresses[short_addr] = long_addr;
@@ -234,6 +205,8 @@ void DaliBusComponent::setup() {
                     }
                 }
             }
+            // Remove this device from the search
+            dali.bus_manager.withdraw(long_addr);
         }
 
         DALI_LOGD("No more devices found!");
@@ -296,7 +269,6 @@ void DaliBusComponent::dump_config() {
     }
 }
 
-
 void inline DaliBusComponent::armInterrupt() {
     this->m_rxPin->attach_interrupt(DaliInterrupt::gpio_intr, &this->m_interrupt_queue, gpio::INTERRUPT_ANY_EDGE);
 }
@@ -310,12 +282,13 @@ void inline DaliBusComponent::disarmInterrupt() {
 #define BIT_PERIOD 833
 
 void DaliBusComponent::writeBit(bool bit) {
+    #define OFFSET 10
     // NOTE: output is inverted - HIGH will pull the bus to 0V (logic low)
     bit = !bit;
     m_txPin->digital_write(bit ? LOW : HIGH);
-    delayMicroseconds(HALF_BIT_PERIOD-6);
+    delayMicroseconds(HALF_BIT_PERIOD-OFFSET);
     m_txPin->digital_write(bit ? HIGH : LOW);
-    delayMicroseconds(HALF_BIT_PERIOD-6);
+    delayMicroseconds(HALF_BIT_PERIOD-OFFSET);
 }
 
 void DaliBusComponent::writeByte(uint8_t b) {
@@ -345,8 +318,14 @@ void DaliBusComponent::resetBus() {
 void DaliBusComponent::sendForwardFrame(uint8_t address, uint8_t data) {
     if (DEBUG_LOG_RXTX) {
         DALI_LOGD("TX: %02x %02x", address, data);
-        delayMicroseconds(BIT_PERIOD*8);
+        // delayMicroseconds(BIT_PERIOD*8);
         //Serial.print("TX: "); Serial.print(address, HEX); Serial.print(" "); Serial.println(data, HEX);
+    }
+
+    // Minimum time before we can read a backward frame
+    uint32_t delay = millis() - m_last_rx_ts;
+    if (delay < (HALF_BIT_PERIOD*22)/1000) { // _BIT_PERIOD is in us, convert to ms
+        delayMicroseconds(delay);
     }
 
     this->disarmInterrupt();
@@ -364,11 +343,13 @@ void DaliBusComponent::sendForwardFrame(uint8_t address, uint8_t data) {
     // Non critical delay
     delayMicroseconds(HALF_BIT_PERIOD*2);
     this->armInterrupt();
+    m_last_rx_ts = millis();
     delayMicroseconds(BIT_PERIOD*4); // Optional, for clarity in scope trace
 }
 
 
 const uint32_t DELTA = 41; // 10% us tolerance
+// const uint32_t DELTA = 60; // FIXME
 /// @brief Check if the time difference is a valid short or long period.
 /// @param diff Time difference in microseconds.
 /// @param long Set to true if the period is a long period, false if short period.
@@ -386,45 +367,33 @@ bool valid_diff_period (uint32_t diff, bool &is_long) {
     return false; // timing weird
 };
 
+void dump_queue(DaliInterrupt &queue) {
+    DALI_LOGD("  RX[%02d]: %10u %5s", 0, queue.received_queue[0].ts, queue.received_queue[0].level ? "HIGH" : "LOW");
+    bool lng = false;
+    for (size_t i = 1; i < queue.received_queue_pos; i++) {
+        uint32_t diff = queue.received_queue[i].ts - queue.received_queue[i-1].ts;
+        DALI_LOGD("  RX[%02d]: %10u %5s %7u %6s", i, queue.received_queue[i].ts, queue.received_queue[i].level ? "HIGH" : "LOW", diff, (valid_diff_period(diff, lng) ? (lng ? "LONG" : "SHORT") : "INVAL") );
+    }
+}
+
+void filter_flukes(DaliInterrupt &queue) {
+    #define THRESHOLD 100 // us
+    // remove glitches (very short pulses)
+    for (size_t i = 1; i < queue.received_queue_pos; i++) {
+        uint32_t diff = queue.received_queue[i].ts - queue.received_queue[i-1].ts;
+        if (diff < THRESHOLD) {
+            // remove this entry by shifting all following entries one position to the left
+            for (size_t j = i; j < queue.received_queue_pos-1; j++) {
+                queue.received_queue[j] = queue.received_queue[j+1];
+            }
+            queue.received_queue[queue.received_queue_pos-1] = {0, false};
+            queue.received_queue_pos--;
+            i--; // recheck this position
+        }
+    }
+}
+
 uint8_t DaliBusComponent::receiveBackwardFrame(unsigned long timeout_ms) {
-    // uint8_t data;
-
-    // unsigned long startTime = millis();
-    // uint32_t startMicros = micros();
-
-    // // Wait for START bit (timing critical)
-    // // TODO: Need a better way to wait for this that doens't block the CPU
-    // while (m_rxPin->digital_read() == LOW) {
-    //     if (millis() - startTime >= timeout_ms) {
-    //         //Serial.println("No reply");
-    //         if (DEBUG_LOG_RXTX) {
-    //             DALI_LOGD("RX: 00 (NACK)");
-    //         }
-    //         return 0;
-    //     }
-    // }
-
-    // {
-    //     // This is timing critical
-    //     InterruptLock lock;
-
-    //     delayMicroseconds(BIT_PERIOD); // Wait for first data bit
-    //     delayMicroseconds(QUARTER_BIT_PERIOD); // Wait a quater bit period to sample middle of first half bit
-    //     data = readByte();
-    //     delayMicroseconds(BIT_PERIOD*2); // Wait for STOP bits
-    // }
-
-    // //Serial.print("RX: "); Serial.println(data, HEX);
-    // if (DEBUG_LOG_RXTX) {
-    //     DALI_LOGD("RX: %02x", data);
-    // }
-
-    // // Minimum time before we can send another forward frame
-    // delayMicroseconds(BIT_PERIOD*8);
-    // return data;
-
-
-
     /*
     SIGNAL CHARACTERISTICS
     High Level: 9.5 to 22.5 V (Typical 16 V)
@@ -481,12 +450,12 @@ uint8_t DaliBusComponent::receiveBackwardFrame(unsigned long timeout_ms) {
     }
 
     if (DEBUG_LOG_RXTX_FULL) {
-        DALI_LOGD("  RX[%02d]: %10u %5s", 0, queue.received_queue[0].ts, queue.received_queue[0].level ? "HIGH" : "LOW");
-        for (size_t i = 1; i < queue.received_queue_pos; i++) {
-            uint32_t diff = queue.received_queue[i].ts - queue.received_queue[i-1].ts;
-            bool lng = false;
-            DALI_LOGD("  RX[%02d]: %10u %5s %7u %6s", i, queue.received_queue[i].ts, queue.received_queue[i].level ? "HIGH" : "LOW", diff, (valid_diff_period(diff, lng) ? (lng ? "LONG" : "SHORT") : "INVAL") );
-        }
+        dump_queue(queue);
+    }
+    filter_flukes(queue);
+    if (DEBUG_LOG_RXTX_FULL) {
+        DALI_LOGD("After filtering:");
+        dump_queue(queue);
     }
 
     // find start bit, first to be low level
@@ -534,6 +503,7 @@ uint8_t DaliBusComponent::receiveBackwardFrame(unsigned long timeout_ms) {
                     || queue.received_queue[pos].level != last_level) {
                     // level did not change, but should have
                     DALI_LOGW("RX: 00 (NACK, level did not change) pos = %u", pos);
+                    dump_queue(queue);
                     return 0;
                 }
             } else {
@@ -543,6 +513,7 @@ uint8_t DaliBusComponent::receiveBackwardFrame(unsigned long timeout_ms) {
                     || queue.received_queue[pos].level == last_level) {
                     // level did change, but should not have
                     DALI_LOGW("RX: 00 (NACK, level changed) pos = %u", pos);
+                    dump_queue(queue);
                     return 0;
                 }
             }
@@ -572,6 +543,7 @@ uint8_t DaliBusComponent::receiveBackwardFrame(unsigned long timeout_ms) {
         } else {
             // timing weird
             DALI_LOGW("RX: 00 (NACK, timing weird) pos = %u", pos);
+            dump_queue(queue);
             return 0;
         }
     }

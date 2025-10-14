@@ -169,7 +169,7 @@ bool DaliBusManager::findNextAddress(short_addr_t& out_short_addr, uint32_t& out
     }
 
     // Remove this device from the search
-    withdraw(addr);
+    // withdraw(addr);
 
     out_long_addr = addr;
 
