@@ -12,20 +12,14 @@ enum class DaliInitMode {
     InitializeAll
 };
 
-struct DaliInterrupt {
-    struct interrupt_entry {
-        uint32_t ts;
-        bool level;
-    };
-
-    #define NUM_ENTRIES 25 // (1 (start bit) + 8 (data bits) + 2 (stop bits)) * 2 + buffer (is this usefull at all?)
-    /* volatile */ interrupt_entry received_queue[NUM_ENTRIES]{0};
-    size_t received_queue_pos{0};
+struct DaliInterruptState {
+    uint32_t frame;
+    uint32_t bitcount;
+    uint32_t timestamp;
 
     InternalGPIOPin* rx_pin{nullptr};
-    bool init{false};
 
-    static void gpio_intr(DaliInterrupt *queue);
+    static void gpio_intr(DaliInterruptState *queue);
     void reset();
 };
 
@@ -90,7 +84,7 @@ private:
     DaliInitMode m_initialize_addresses = DaliInitMode::DiscoverOnly;
     uint32_t m_addresses[ADDR_SHORT_MAX+1] = {0};
 
-    DaliInterrupt m_interrupt_queue;
+    DaliInterruptState m_interrupt_state;
 };
 
 }  // namespace dali
