@@ -283,7 +283,7 @@ void DaliBusComponent::setup() {
 }
 
 void DaliBusComponent::create_light_component(short_addr_t short_addr, uint32_t long_addr) {
-#ifdef USE_LIGHT
+#ifdef false // USE_LIGHT code isn't working properly and since 2026.01 stopped compiling
     DaliLight* dali_light = new DaliLight { this };
     dali_light->set_address(short_addr);
     // the previous call overrides the long address with `0xffff`, set it again, since we know it here
