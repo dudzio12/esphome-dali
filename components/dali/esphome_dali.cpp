@@ -577,11 +577,11 @@ void DaliBusComponent::dump_device_info(short_addr_t addr) {
 
     // Scenes (0-15)
     ESP_LOGI(TAG, "╠── Scenes ────────────────────────────────");
-    char scene_buf[128];
+    char scene_buf[160];  // worst case: 16 scenes × " S15=254" (9 chars) = 144 + null
     int pos = 0;
     for (uint8_t s = 0; s < 16; s++) {
         uint8_t scene_level = dali.port.sendQueryCommand(addr, (DaliCommand)(0xB0 + s));
-        if (scene_level != 0xFF) {
+        if (scene_level != 0xFF && pos < (int)sizeof(scene_buf) - 12) {
             pos += snprintf(scene_buf + pos, sizeof(scene_buf) - pos, " S%d=%d", s, scene_level);
         }
     }
@@ -1046,11 +1046,13 @@ void DaliBusComponent::check_bus_activity() {
     if (m_tx_active) return;
     if (m_rx_state.rxstate != 2) return;  // no completed frame
 
-    // Copy ISR data and reset immediately to avoid race condition
+    // Copy ISR data and reset atomically (disable interrupts briefly)
+    portDISABLE_INTERRUPTS();
     uint8_t rxpos = m_rx_state.rxpos;
     uint8_t raw_copy[DaliTimerRxState::RX_BUF_SIZE];
     memcpy(raw_copy, (const void*)m_rx_state.rxdata, rxpos);
     m_rx_state.reset();
+    portENABLE_INTERRUPTS();
 
     // Decode from local copy (ISR may already be filling new frame)
     uint8_t decoded[4] = {0};
@@ -1226,7 +1228,7 @@ void DaliBusComponent::dump_config() {
     ESP_LOGCONFIG(TAG, "  Dynamic lights: %d", m_dynamic_lights.size());
     ESP_LOGCONFIG(TAG, "  Diag sensors: %d devices", m_diag_sensors.size());
     ESP_LOGCONFIG(TAG, "  assigned short addresses:");
-    for (int i = 0; i < ADDR_SHORT_MAX; i++) {
+    for (int i = 0; i <= ADDR_SHORT_MAX; i++) {
         if (m_addresses[i] > 0) {
             ESP_LOGCONFIG(TAG, "   - %.2u = %.6x", i, m_addresses[i]);
         }

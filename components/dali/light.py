@@ -84,10 +84,10 @@ def validate_fade_time(value):
 
 def validate_fade_rate(value):
     if not isinstance(value, int):
-        raise cv.Invalid("Fade time must be a positive integer")
+        raise cv.Invalid("Fade rate must be a positive integer")
     if value <= 0:
         # NOTE: 0 also not allowed for fade rate
-        raise cv.Invalid("Fade time must be a positive integer")
+        raise cv.Invalid("Fade rate must be a positive integer")
     
     if value <= 15:
         return value

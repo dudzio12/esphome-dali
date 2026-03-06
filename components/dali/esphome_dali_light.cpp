@@ -15,16 +15,22 @@ static const char *const TAG = "dali.light";
 void dali::DaliLight::setup_state(light::LightState *state) {
     // Initialization code for DaliLight
 
-    // Exclude broadcast and group addresses
-    if ((this->address_ != ADDR_BROADCAST) && ((this->address_ & ADDR_GROUP_MASK) == 0)) {
+    // Only query individual short addresses (0-63), skip broadcast/group
+    if (this->address_ <= ADDR_SHORT_MAX) {
         ESP_LOGD(TAG, "Querying DALI device capabilities...");
         if (bus->dali.isDevicePresent(address_)) {
             ESP_LOGD(TAG, "DALI[%.2x] Is Present", address_);
 
             this->dali_level_min_ = bus->dali.lamp.getMinLevel(address_);
             this->dali_level_max_ = bus->dali.lamp.getMaxLevel(address_);
+            if (this->dali_level_min_ == 0 || this->dali_level_max_ == 0 || this->dali_level_min_ > this->dali_level_max_) {
+                ESP_LOGW(TAG, "Invalid level range reported (min=%d max=%d), using defaults 1..254",
+                         this->dali_level_min_, this->dali_level_max_);
+                this->dali_level_min_ = 1;
+                this->dali_level_max_ = 254;
+            }
             this->dali_level_range_ = (float)(dali_level_max_ - this->dali_level_min_ + 1);
-            ESP_LOGD(TAG, "Reported min:%d max:%d", this->dali_level_min_, this->dali_level_max_);
+            ESP_LOGD(TAG, "Effective min:%d max:%d", this->dali_level_min_, this->dali_level_max_);
 
             // NOTE: Some DALI controllers report their device type is LED(6) even though they do also support color temperature,
             // so let's explicitly check if they respond to this:
@@ -156,7 +162,7 @@ void dali::DaliLight::write_state(light::LightState *state) {
         state->current_values_as_brightness(&brightness);
     }
 
-    int dali_brightness = static_cast<uint8_t>(brightness * this->dali_level_range_) + this->dali_level_min_ - 1;
+    int dali_brightness = static_cast<int>(brightness * this->dali_level_range_) + this->dali_level_min_ - 1;
     if (dali_brightness < 1) dali_brightness = 1;
     if (dali_brightness > 254) dali_brightness = 254;
 
