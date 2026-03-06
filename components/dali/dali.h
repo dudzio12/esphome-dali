@@ -241,7 +241,7 @@ public:
     /// @return Response byte (0xFF: success, 0x00: failure, or other byte)
     uint8_t sendQueryCommand(short_addr_t addr, DaliCommand command) {
         sendForwardFrame(
-            (addr << 1) | DALI_COMMAND, 
+            (addr << 1) | DALI_COMMAND,
             static_cast<uint8_t>(command));
 
         return receiveBackwardFrame();
@@ -394,8 +394,10 @@ DaliBusManager(DaliPort& port)
 
         port.sendSpecialCommand(DaliSpecialCommand::COMPARE, 0);
 
-        const unsigned long timeout_ms = 10;
-        return (port.receiveBackwardFrame(timeout_ms) == 0xFF);
+        const unsigned long timeout_ms = 50;
+        uint8_t reply = port.receiveBackwardFrame(timeout_ms);
+        // Accept 0xFF (exact) or 0xFE (1-bit decode error) as YES
+        return (reply >= 0xFE);
     }
 
     /// @brief Tell the device matching the address in SEARCH[H,M,L] to ignore the COMPARE command from now on.
@@ -418,7 +420,8 @@ DaliBusManager(DaliPort& port)
         port.sendSpecialCommand(DaliSpecialCommand::PROGRAM_SHORT_ADDRESS, addr);
 
         port.sendSpecialCommand(DaliSpecialCommand::VERIFY_SHORT_ADDRESS, addr);
-        return (port.receiveBackwardFrame() == 0xFF);
+        uint8_t reply = port.receiveBackwardFrame();
+        return (reply >= 0xFE);
     }
 
     void clearShortAddress() {

@@ -57,6 +57,12 @@ class DaliLight : public light::LightOutput, public Component {
     void set_fade_time(uint16_t fade_time) { fade_time_ = fade_time; }
     void set_fade_rate(uint16_t fade_rate) { fade_rate_ = fade_rate; }
 
+    uint8_t get_address() const { return address_; }
+
+    /// Suppress next write_state() call (used for external bus updates to avoid feedback loop)
+    void set_suppress_write(bool v) { suppress_write_ = v; }
+    bool get_suppress_write() const { return suppress_write_; }
+
     // NOTE: Must have a lower priority number than the DALI bus component
     float get_setup_priority() const override { return setup_priority::DATA; }
 
@@ -78,7 +84,8 @@ class DaliLight : public light::LightOutput, public Component {
     optional<DaliLedDimmingCurve> brightness_curve_;
 
     bool tc_supported_;
-    
+    bool suppress_write_{false};
+    uint16_t last_color_temp_{0};
 };
 
 }  // namespace dali
